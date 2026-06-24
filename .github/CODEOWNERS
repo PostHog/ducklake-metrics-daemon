@@ -1,0 +1,3 @@
+# Default owner for every file in the repo.
+# Members of @PostHog/team-managed-warehouse get auto-requested on every PR.
+*   @PostHog/team-managed-warehouse
