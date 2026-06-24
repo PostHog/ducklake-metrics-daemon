@@ -13,16 +13,18 @@ updates:
       - dependencies
       - go
 
-  # GitHub Actions workflow pinning. Same cadence; security updates
-  # auto-merge via Dependabot's standard PR flow.
+  # GitHub Actions: open-pull-requests-limit=0 keeps the ecosystem
+  # registered so security advisories still trigger PRs, but suppresses
+  # weekly proactive bumps. Matches posthog/.github/dependabot.yml.
+  # Reason: PostHog org policy requires every action pinned to a full
+  # commit SHA; Dependabot's default bump points at version tags
+  # (e.g. @v7) which fails the org's pre-job action allowlist. Manual
+  # SHA bumps as needed instead.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
-      day: monday
-      time: "07:00"
-      timezone: Europe/London
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     labels:
       - dependencies
       - github-actions
