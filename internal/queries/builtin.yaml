@@ -1,0 +1,208 @@
+queries:
+  - name: ducklake_pending_deletes
+    help: |
+      Pending-deletion queue depth. `total` is the row count
+      (`ducklake_files_scheduled_for_deletion`); each row references one file
+      path. `unique_paths` is the distinct file count (use this for "how many
+      files are queued"). `dup_rows = total - unique_paths` surfaces the
+      duplicate-row pathology that self-poisons the next cleanup
+      (DuckLake upstream bug c5).
+    values: [total, unique_paths, dup_rows]
+    sql: |
+      SELECT
+        COUNT(*) AS total,
+        COUNT(DISTINCT path) AS unique_paths,
+        COUNT(*) - COUNT(DISTINCT path) AS dup_rows
+      FROM public.ducklake_files_scheduled_for_deletion
+
+  - name: ducklake_data_files
+    help: |
+      Live data-file (parquet) totals. `files` = file count, `bytes` = total
+      on-disk size, `rows` = total records across all live files. "Live" =
+      `end_snapshot IS NULL`. Per-band breakdown lives in
+      `ducklake_files_per_band`; this is the rollup for "how big is the lake."
+    values: [files, bytes, rows]
+    sql: |
+      SELECT
+        COUNT(*) AS files,
+        COALESCE(SUM(file_size_bytes), 0) AS bytes,
+        COALESCE(SUM(record_count), 0)    AS rows
+      FROM public.ducklake_data_file
+      WHERE end_snapshot IS NULL
+
+  - name: ducklake_delete_files
+    help: |
+      Live delete-vector (puffin/parquet) totals. Same shape as
+      ducklake_data_files but for the delete side. Outsized vs.
+      ducklake_data_files_files = lots of unmerged deletes; ripe for
+      `ducklake_rewrite_data_files` maintenance.
+    values: [files, bytes]
+    sql: |
+      SELECT
+        COUNT(*) AS files,
+        COALESCE(SUM(file_size_bytes), 0) AS bytes
+      FROM public.ducklake_delete_file
+      WHERE end_snapshot IS NULL
+
+  - name: ducklake_files_per_band
+    help: |
+      Live data files grouped into compaction-relevant size bands. Tiers
+      match `ducklake_maintenance.py`'s TIERS spec — `tier1` (<1 MiB),
+      `tier2` (1-10 MiB), `tier3` (10-64 MiB) are compaction targets;
+      `large` (>=64 MiB) is past the compaction threshold and is just
+      reported for shape. Sum across bands equals `ducklake_data_files_files`.
+    labels: [band]
+    values: [count, bytes]
+    sql: |
+      SELECT
+        CASE
+          WHEN file_size_bytes < 1048576   THEN 'tier1'
+          WHEN file_size_bytes < 10485760  THEN 'tier2'
+          WHEN file_size_bytes < 67108864  THEN 'tier3'
+          ELSE 'large'
+        END AS band,
+        COUNT(*) AS count,
+        COALESCE(SUM(file_size_bytes), 0) AS bytes
+      FROM public.ducklake_data_file
+      WHERE end_snapshot IS NULL
+      GROUP BY band
+
+  - name: ducklake_snapshots
+    help: |
+      Snapshot population, ages (seconds), and id bounds. Expose the raw
+      `oldest_id`/`newest_id` (counter-like, monotonic) so PromQL can
+      derive the commit rate via `deriv(ducklake_snapshots_newest_id[5m])`
+      — no per-sample storage in the daemon.
+    values: [count, oldest_seconds_ago, newest_seconds_ago, oldest_id, newest_id]
+    sql: |
+      SELECT
+        COUNT(*) AS count,
+        COALESCE(EXTRACT(EPOCH FROM (now() - MIN(CAST(snapshot_time AS TIMESTAMPTZ)))), 0) AS oldest_seconds_ago,
+        COALESCE(EXTRACT(EPOCH FROM (now() - MAX(CAST(snapshot_time AS TIMESTAMPTZ)))), 0) AS newest_seconds_ago,
+        COALESCE(MIN(snapshot_id), 0) AS oldest_id,
+        COALESCE(MAX(snapshot_id), 0) AS newest_id
+      FROM public.ducklake_snapshot
+
+  - name: ducklake_inlined_data_tables
+    help: |
+      Count of rows in `ducklake_inlined_data_tables` (the registry of
+      per-table inline-data tables that DuckLake creates when a write goes
+      through the inlining path). Should stay small in steady state;
+      runaway growth indicates `data_inlining_row_limit` isn't being
+      honored by writers, or writers are creating tables faster than
+      maintenance can drop them (see `ducklake_unreachable_inline_tables`).
+    values: [total]
+    sql: |
+      SELECT COUNT(*) AS total
+      FROM public.ducklake_inlined_data_tables
+
+  - name: ducklake_unreachable_inline_tables
+    help: |
+      Count of `ducklake_inlined_data_tables` entries whose parent
+      `ducklake_table` has no snapshot-reachable row. These are orphans
+      that DuckLake's own GC (DropEmptySupersededInlinedTables) won't
+      reach because it only acts on superseded-and-empty, not
+      parent-dropped. Should be 0 or near-0 after cleanup; growing trend
+      means the data_imports DROP+CREATE pattern is producing orphans.
+      Uses the range-overlap predicate (strict superset of "actually
+      reachable"; safe-conservative — won't false-positive an unreachable
+      table). See INCIDENT.md.
+    values: [total]
+    sql: |
+      WITH bounds AS (
+        SELECT MIN(snapshot_id) AS lo, MAX(snapshot_id) AS hi
+        FROM public.ducklake_snapshot
+      ),
+      reachable AS (
+        SELECT DISTINCT t.table_id
+        FROM public.ducklake_table t, bounds
+        WHERE t.begin_snapshot <= bounds.hi
+          AND (t.end_snapshot IS NULL OR t.end_snapshot > bounds.lo)
+      )
+      SELECT COUNT(*) AS total
+      FROM public.ducklake_inlined_data_tables idt
+      WHERE NOT EXISTS (SELECT 1 FROM reachable r WHERE r.table_id = idt.table_id)
+
+  - name: ducklake_tables
+    help: |
+      Count of `ducklake_table` rows split by lifecycle state.
+      `state="live"` = `end_snapshot IS NULL` (currently visible to the
+      latest snapshot). `state="dropped"` = `end_snapshot` set (still
+      readable by historical snapshots until expire+cleanup reaps them).
+      Imbalance — many dropped, few live — indicates DROP+CREATE churn
+      (data_imports anti-pattern).
+    labels: [state]
+    values: [count]
+    sql: |
+      SELECT
+        CASE WHEN end_snapshot IS NULL THEN 'live' ELSE 'dropped' END AS state,
+        COUNT(*) AS count
+      FROM public.ducklake_table
+      GROUP BY state
+
+  - name: ducklake_files_per_partition_top20
+    help: Twenty heaviest partitions by live data-file count (composite values joined with '/').
+    labels: [partition]
+    values: [count]
+    sql: |
+      WITH labels AS (
+        SELECT data_file_id,
+               string_agg(partition_value, '/' ORDER BY partition_key_index) AS partition
+        FROM public.ducklake_file_partition_value
+        GROUP BY data_file_id
+      )
+      SELECT
+        COALESCE(l.partition, '<none>') AS partition,
+        COUNT(*) AS count
+      FROM public.ducklake_data_file df
+      LEFT JOIN labels l USING (data_file_id)
+      WHERE df.end_snapshot IS NULL
+      GROUP BY partition
+      ORDER BY count DESC
+      LIMIT 20
+
+  - name: ducklake_catalog
+    help: |
+      DuckLake catalog format version. The numeric major.minor lands in the
+      gauge value (1.0, 1.1, 2.0…); any trailing non-numeric tag DuckLake
+      attaches (currently '-dev1' on main after MigrateV10, future '-rcN' /
+      '-betaN' shapes welcome) lands in the `suffix` label so dashboards
+      can flag dev/pre-release builds without losing PromQL ordering on
+      the value. Empty `suffix=""` means a clean release. Pure-junk values
+      like 'foo' fail loudly via the error counter — the correct signal.
+    labels: [suffix]
+    values: [format_version]
+    sql: |
+      SELECT
+        CAST(substring(value from '^([0-9]+(\.[0-9]+)?)') AS DOUBLE PRECISION) AS format_version,
+        regexp_replace(value, '^[0-9]+(\.[0-9]+)?', '') AS suffix
+      FROM public.ducklake_metadata
+      WHERE key = 'version' AND scope IS NULL
+
+  - name: ducklake_config
+    help: |
+      Operationally-relevant DuckLake catalog config values from
+      `ducklake_metadata`. Currently tracks `auto_compact` and
+      `data_inlining_row_limit` at every scope (global / schema / table) —
+      `auto_compact != 'true'` silently disables every maintenance
+      function call against the affected table, and a non-zero
+      `data_inlining_row_limit` is what generates the inline-table
+      backlog this daemon watches. Boolean strings ('true'/'false') map
+      to 1/0; numeric strings cast directly; anything else returns NULL
+      and the sample is dropped (error counter still ticks, surfacing
+      the bad value).
+    labels: [key, scope, scope_id]
+    values: [value]
+    sql: |
+      SELECT
+        key,
+        COALESCE(scope, '') AS scope,
+        COALESCE(CAST(scope_id AS VARCHAR), '') AS scope_id,
+        CASE
+          WHEN value = 'true'  THEN 1.0
+          WHEN value = 'false' THEN 0.0
+          WHEN value ~ '^-?[0-9]+(\.[0-9]+)?$' THEN CAST(value AS DOUBLE PRECISION)
+          ELSE NULL
+        END AS value
+      FROM public.ducklake_metadata
+      WHERE key IN ('auto_compact', 'data_inlining_row_limit')
