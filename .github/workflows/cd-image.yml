@@ -80,3 +80,51 @@ jobs:
             VERSION=${{ steps.version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Promote-to-prod is operator-triggered, not auto-fired on every main
+  # push. Rationale: managed-warehouse has no functioning dev environment,
+  # so auto-promote-to-dev's "verify in dev before prod" loop doesn't apply;
+  # every dispatch is effectively a prod intent. Operator runs this via
+  # GitHub Actions → "Container Image CD" → "Run workflow" → main.
+  # `require_prod_approval: true` in charts/state/ducklake-metrics-daemon.yaml
+  # adds a second gate at ArgoCD before prod actually rolls.
+  dispatch_state_update:
+    name: Dispatch state update to charts
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    steps:
+      - name: Compute short SHA
+        id: short_sha
+        run: echo "sha=$(echo '${{ github.sha }}' | cut -c1-7)" >> "$GITHUB_OUTPUT"
+
+      - name: Get deployer token
+        id: deployer
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        with:
+          app-id: ${{ secrets.GH_APP_CHARTS_DEPLOYER_APP_ID }}
+          private-key: ${{ secrets.GH_APP_CHARTS_DEPLOYER_PRIVATE_KEY }}
+          owner: PostHog
+          repositories: charts
+
+      - name: Trigger charts state update
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
+        with:
+          token: ${{ steps.deployer.outputs.token }}
+          repository: PostHog/charts
+          event-type: commit_state_update
+          client-payload: |
+            {
+              "values": {
+                "image": {
+                  "sha": "sha-${{ steps.short_sha.outputs.sha }}"
+                }
+              },
+              "release": "ducklake-metrics-daemon",
+              "commit": ${{ toJson(github.event.head_commit) }},
+              "repository": ${{ toJson(github.repository) }},
+              "labels": [],
+              "timestamp": "${{ github.event.head_commit.timestamp }}"
+            }
