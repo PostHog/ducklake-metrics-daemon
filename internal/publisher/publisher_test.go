@@ -15,8 +15,10 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"math/big"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/posthog/ducklake-metrics-daemon/internal/catalog"
 	"github.com/posthog/ducklake-metrics-daemon/internal/metrics"
 	"github.com/posthog/ducklake-metrics-daemon/internal/queries"
@@ -418,3 +420,35 @@ func TestResetTenantGauges(t *testing.T) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// TestToFloatNumeric covers the case that prompted the explicit
+// pgtype.Numeric arm in toFloat: SUM(BIGINT) and EXTRACT(EPOCH ...)
+// return Postgres NUMERIC, which pgx decodes as pgtype.Numeric. The
+// prior fmt.Sprintf("%v",...) fallback produced struct-dump strings
+// that strconv.ParseFloat rejected, so every COALESCE(SUM(...),0)
+// column silently failed conversion and dropped from gauges.
+func TestToFloatNumeric(t *testing.T) {
+	cases := []struct {
+		name string
+		in   pgtype.Numeric
+		want float64
+		ok   bool
+	}{
+		{"valid int", pgtype.Numeric{Int: big.NewInt(12345), Exp: 0, Valid: true}, 12345, true},
+		{"valid with exp", pgtype.Numeric{Int: big.NewInt(12345), Exp: -2, Valid: true}, 123.45, true},
+		{"valid zero", pgtype.Numeric{Int: big.NewInt(0), Exp: 0, Valid: true}, 0, true},
+		{"valid large", pgtype.Numeric{Int: big.NewInt(1_000_000_000_000), Exp: 0, Valid: true}, 1e12, true},
+		{"invalid", pgtype.Numeric{Valid: false}, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := toFloat(tc.in)
+			if ok != tc.ok {
+				t.Fatalf("ok = %v, want %v", ok, tc.ok)
+			}
+			if ok && got != tc.want {
+				t.Errorf("got = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

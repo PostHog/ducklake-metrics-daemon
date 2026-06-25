@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/posthog/ducklake-metrics-daemon/internal/catalog"
 	"github.com/posthog/ducklake-metrics-daemon/internal/metrics"
 	"github.com/posthog/ducklake-metrics-daemon/internal/queries"
@@ -399,8 +400,22 @@ func toFloat(v any) (float64, bool) {
 	case string:
 		f, err := strconv.ParseFloat(t, 64)
 		return f, err == nil
+	case pgtype.Numeric:
+		// PG SUM(BIGINT) and EXTRACT(EPOCH ...) return NUMERIC, which
+		// pgx decodes as pgtype.Numeric. Its default %v format is a
+		// struct dump ("{12345 -2 false ... true}"), so the
+		// strconv.ParseFloat fallback below cannot parse it. Use
+		// Float64Value() which converts via big.Int + Exp properly.
+		if !t.Valid {
+			return 0, false
+		}
+		f8, err := t.Float64Value()
+		if err != nil || !f8.Valid {
+			return 0, false
+		}
+		return f8.Float64, true
 	default:
-		// pgtype.Numeric arrives here; round-trip via fmt as a fallback.
+		// Last-ditch fallback for any decoded type with a sane String().
 		s := fmt.Sprintf("%v", v)
 		f, err := strconv.ParseFloat(s, 64)
 		return f, err == nil
