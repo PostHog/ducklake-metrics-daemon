@@ -9,6 +9,10 @@ updates:
       time: "07:00"
       timezone: Europe/London
     open-pull-requests-limit: 5
+    # Wait 7 days before bumping to a newly published version — supply-
+    # chain defense against malicious or unstable just-published releases.
+    cooldown:
+      default-days: 7
     labels:
       - dependencies
       - go
@@ -25,6 +29,8 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 0
+    cooldown:
+      default-days: 7
     labels:
       - dependencies
       - github-actions
@@ -38,6 +44,8 @@ updates:
       time: "07:00"
       timezone: Europe/London
     open-pull-requests-limit: 3
+    cooldown:
+      default-days: 7
     labels:
       - dependencies
       - docker
