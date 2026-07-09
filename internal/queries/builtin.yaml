@@ -140,6 +140,47 @@ queries:
       FROM public.ducklake_table
       GROUP BY state
 
+  - name: ducklake_stats_rows
+    help: |
+      Row counts of the global-stats tables (`stats_table="table"` =
+      `ducklake_table_stats`, `stats_table="column"` =
+      `ducklake_table_column_stats`), split into `total` and `orphaned`.
+      `orphaned` = rows whose table_id has no live `ducklake_table` row
+      (`end_snapshot IS NULL`): DROP TABLE only end-snapshots the table,
+      the stats rows linger until snapshot expiry actually deletes the
+      table row. These tables are read IN FULL on EVERY commit attempt
+      (GetSnapshotAndStatsAndChanges), so `total` is a direct
+      commit-latency tax and `orphaned` is the purgeable share — one
+      production catalog reached 99.3% orphaned (3.68M of 3.71M column
+      rows) and commits ran 30-50x slower until the orphans were purged.
+      Alert on `orphaned` growth; heavy DROP+CREATE churn (see
+      `ducklake_tables` state="dropped") is what produces it.
+    labels: [stats_table]
+    values: [total, orphaned]
+    sql: |
+      WITH live AS (
+        -- DISTINCT: one-live-row-per-table_id is a writer-protocol
+        -- invariant, not DB-enforced (ducklake_table has no PK/unique),
+        -- so guard the join against fan-out inflating `total` during
+        -- exactly the kind of catalog anomaly this daemon exists to catch.
+        SELECT DISTINCT table_id
+        FROM public.ducklake_table
+        WHERE end_snapshot IS NULL
+      )
+      SELECT
+        'table' AS stats_table,
+        COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE l.table_id IS NULL) AS orphaned
+      FROM public.ducklake_table_stats s
+      LEFT JOIN live l USING (table_id)
+      UNION ALL
+      SELECT
+        'column',
+        COUNT(*),
+        COUNT(*) FILTER (WHERE l.table_id IS NULL)
+      FROM public.ducklake_table_column_stats s
+      LEFT JOIN live l USING (table_id)
+
   - name: ducklake_files_per_partition_top20
     help: Twenty heaviest partitions by live data-file count (composite values joined with '/').
     labels: [partition]
