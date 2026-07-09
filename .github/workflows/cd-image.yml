@@ -68,6 +68,7 @@ jobs:
         run: echo "version=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: .
@@ -80,6 +81,10 @@ jobs:
             VERSION=${{ steps.version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+    outputs:
+      # OCI index digest ("sha256:<64-hex>") of the pushed image; consumed by
+      # dispatch_state_update to build the pinned image ref for charts state.
+      digest: ${{ steps.build.outputs.digest }}
 
   # Promote-to-prod is operator-triggered, not auto-fired on every main
   # push. Rationale: managed-warehouse has no functioning dev environment,
@@ -96,10 +101,6 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Compute short SHA
-        id: short_sha
-        run: echo "sha=$(echo '${{ github.sha }}' | cut -c1-7)" >> "$GITHUB_OUTPUT"
-
       - name: Get deployer token
         id: deployer
         uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
@@ -115,11 +116,17 @@ jobs:
           token: ${{ steps.deployer.outputs.token }}
           repository: PostHog/charts
           event-type: commit_state_update
+          # image.sha uses the pinned <full-git-sha>@sha256:<digest> form (the
+          # full sha is a pushed tag; the digest pins the exact index). This is
+          # the form charts' promote-to-prod validates against — its image-ref
+          # regex rejects the short "sha-<7hex>" tag form, and its
+          # never-appeared-in-state-history check means only refs written here
+          # can ever be promoted to prod.
           client-payload: |
             {
               "values": {
                 "image": {
-                  "sha": "sha-${{ steps.short_sha.outputs.sha }}"
+                  "sha": "${{ github.sha }}@${{ needs.build.outputs.digest }}"
                 }
               },
               "release": "ducklake-metrics-daemon",
