@@ -38,6 +38,35 @@ func TestBuiltinsNoLeakedAlias(t *testing.T) {
 	}
 }
 
+// TestPartitionValueCorruptionCountsPositions guards the ncols computation
+// in ducklake_partition_value_corruption. events/persons partition by
+// multiple transforms (year/month/day/hour) on ONE source column, so all
+// positions share a column_id; counting DISTINCT column_id collapses a
+// 4-position partition to 1 and false-flags every file (this shipped once
+// and reported 17M "corrupt" files on megaduck.events). ncols must count
+// partition_key_index (the position), not column_id.
+func TestPartitionValueCorruptionCountsPositions(t *testing.T) {
+	qs, err := LoadBuiltins()
+	if err != nil {
+		t.Fatalf("LoadBuiltins: %v", err)
+	}
+	var sql string
+	for _, q := range qs {
+		if q.Name == "ducklake_partition_value_corruption" {
+			sql = q.SQL
+		}
+	}
+	if sql == "" {
+		t.Fatal("ducklake_partition_value_corruption not found in builtins")
+	}
+	if !strings.Contains(sql, "COUNT(DISTINCT pc.partition_key_index)") {
+		t.Error("ncols must be COUNT(DISTINCT pc.partition_key_index) — counting positions, not columns")
+	}
+	if strings.Contains(sql, "DISTINCT pi.table_id, pc.column_id") {
+		t.Error("ncols must NOT count DISTINCT column_id — collapses multi-transform-on-one-column partitions (year/month/day/hour), false-flagging every file")
+	}
+}
+
 func TestLoadFileEmptyPath(t *testing.T) {
 	qs, err := LoadFile("")
 	if err != nil {
