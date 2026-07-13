@@ -86,18 +86,20 @@ jobs:
       # dispatch_state_update to build the pinned image ref for charts state.
       digest: ${{ steps.build.outputs.digest }}
 
-  # Promote-to-prod is operator-triggered, not auto-fired on every main
-  # push. Rationale: managed-warehouse has no functioning dev environment,
-  # so auto-promote-to-dev's "verify in dev before prod" loop doesn't apply;
-  # every dispatch is effectively a prod intent. Operator runs this via
-  # GitHub Actions → "Container Image CD" → "Run workflow" → main.
-  # `require_prod_approval: true` in charts/state/ducklake-metrics-daemon.yaml
-  # adds a second gate at ArgoCD before prod actually rolls.
+  # Update charts state (image.dev / image.sha) on every merge to main —
+  # matches the house pattern (duckgres/posthog "Container Image CD"): a
+  # merge auto-lands in state, and prod stays a manual promote via charts'
+  # Promote-to-Prod workflow, gated by `require_prod_approval: true` in
+  # charts/state/ducklake-metrics-daemon.yaml. Runs on push-to-main and on
+  # manual workflow_dispatch; the ref guard excludes PRs and tag pushes.
+  # (Previously gated to workflow_dispatch only, which diverged from every
+  # other repo and surprised operators — a merge built the image but never
+  # wrote state, so promote-to-prod rejected the never-in-state ref.)
   dispatch_state_update:
     name: Dispatch state update to charts
     runs-on: ubuntu-latest
     needs: [build]
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main'
     permissions:
       contents: read
     steps:
