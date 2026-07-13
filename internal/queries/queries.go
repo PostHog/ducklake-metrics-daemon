@@ -44,6 +44,24 @@ type Query struct {
 	Labels []string `yaml:"labels,omitempty"`
 	Values []string `yaml:"values"`
 	SQL    string   `yaml:"sql"`
+	// IntervalSeconds, when > 0, runs this query on its own cadence
+	// instead of every scheduler cycle: the runner skips it until at
+	// least this many seconds have elapsed since its last execution.
+	// Use for expensive queries that don't need cycle-frequency
+	// freshness (e.g. a full-catalog scan). 0 (default) = every cycle.
+	// Rounded up to a whole number of cycles in practice, since the
+	// scheduler only re-evaluates due-ness on each cycle tick.
+	//
+	// The interval is measured from DISPATCH, not completion: the run
+	// time is recorded when the query is selected, before it executes.
+	// So a query that times out or is overrun-killed is NOT retried
+	// before its next window — a permanently-failing hourly query is
+	// attempted only hourly (deliberate: a heavy scan that can't finish
+	// in QueryTimeout won't finish in one cycle either, and retrying it
+	// every cycle would just hammer the catalog DB). Watch
+	// ducklake_metrics_query_last_success_timestamp / cycle_killed_total
+	// to catch one that never completes.
+	IntervalSeconds int `yaml:"interval_seconds,omitempty"`
 }
 
 // yamlDoc is the top-level YAML shape.
@@ -129,6 +147,9 @@ func validate(q *Query) error {
 	}
 	if q.SQL == "" {
 		return fmt.Errorf("sql must be set")
+	}
+	if q.IntervalSeconds < 0 {
+		return fmt.Errorf("interval_seconds must be >= 0, got %d", q.IntervalSeconds)
 	}
 	return nil
 }
