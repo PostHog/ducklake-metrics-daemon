@@ -65,6 +65,13 @@ func TestPartitionValueCorruptionCountsPositions(t *testing.T) {
 	if strings.Contains(sql, "DISTINCT pi.table_id, pc.column_id") {
 		t.Error("ncols must NOT count DISTINCT column_id — collapses multi-transform-on-one-column partitions (year/month/day/hour), false-flagging every file")
 	}
+	// A live file of a partitioned table can legitimately have ZERO fpv rows
+	// (unpartitioned/lake-relative inline or seed writes); those must be
+	// excluded, not false-flagged. array_agg over zero rows is NULL, so the
+	// bad-file predicate must gate on idx IS NOT NULL.
+	if !strings.Contains(sql, "idx IS NOT NULL") {
+		t.Error("bad-file predicate must require idx IS NOT NULL — else zero-fpv unpartitioned/lake-relative files are false-flagged")
+	}
 }
 
 func TestLoadFileEmptyPath(t *testing.T) {
