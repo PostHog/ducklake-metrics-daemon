@@ -286,18 +286,20 @@ queries:
     values: [files]
     sql: |
       WITH pcols AS (
-        -- Partition-column count per table. DISTINCT (table_id, column_id)
-        -- guards against join fan-out if a table_id ever has more than one
-        -- live partition_info row (writer-protocol invariant, not DB-enforced
-        -- — same defense as ducklake_stats_rows).
-        SELECT table_id, COUNT(*) AS ncols
-        FROM (
-          SELECT DISTINCT pi.table_id, pc.column_id
-          FROM public.ducklake_partition_info pi
-          JOIN public.ducklake_partition_column pc USING (partition_id)
-          WHERE pi.end_snapshot IS NULL
-        ) d
-        GROUP BY table_id
+        -- Number of partition POSITIONS per table = COUNT(DISTINCT
+        -- partition_key_index) of the live partition. NOT column_id:
+        -- events/persons partition by multiple transforms
+        -- (year/month/day/hour) on ONE source column, so every position
+        -- shares a column_id — counting distinct column_id collapses a
+        -- 4-position partition to 1 and false-flags EVERY file (expected
+        -- {0} vs real {0,1,2,3}). partition_key_index is the 0-based
+        -- position; duplicate live partition_info rows carry the same index
+        -- set, so DISTINCT also serves as the fan-out guard.
+        SELECT pi.table_id, COUNT(DISTINCT pc.partition_key_index) AS ncols
+        FROM public.ducklake_partition_info pi
+        JOIN public.ducklake_partition_column pc USING (partition_id)
+        WHERE pi.end_snapshot IS NULL
+        GROUP BY pi.table_id
       ),
       perfile AS (
         -- One row per live file of a partitioned table: the sorted distinct
