@@ -112,6 +112,18 @@ func main() {
 	}
 	qs := queries.Merge(builtins, user, cfg.DisabledQueries)
 
+	// A per-query interval below the cycle interval is a misconfig: the
+	// scheduler only re-evaluates due-ness on cycle ticks, so any
+	// interval_seconds < cycle rounds up to "every cycle" and does
+	// nothing. Warn loudly rather than silently ignoring it.
+	cycleSecs := int(cfg.CycleInterval.Seconds())
+	for _, q := range qs {
+		if q.IntervalSeconds > 0 && q.IntervalSeconds < cycleSecs {
+			log.Warn("query interval_seconds below cycle interval; effectively every cycle",
+				"query", q.Name, "interval_seconds", q.IntervalSeconds, "cycle_interval_s", cycleSecs)
+		}
+	}
+
 	tenantIDs := sortedKeys(cfg.Tenants)
 	log.Info("starting",
 		"version", version,

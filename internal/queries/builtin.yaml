@@ -247,3 +247,89 @@ queries:
         END AS value
       FROM public.ducklake_metadata
       WHERE key IN ('auto_compact', 'data_inlining_row_limit')
+
+  - name: ducklake_partition_value_corruption
+    # Full-catalog per-file scan of ducklake_file_partition_value — the
+    # heaviest builtin. Hourly cadence (this is a slow-moving integrity
+    # signal, not a real-time metric); a covering index on
+    # ducklake_file_partition_value(data_file_id, partition_key_index,
+    # partition_value) makes the per-file aggregation an index-only scan
+    # (millpond bootstrap-indexes).
+    interval_seconds: 3600
+    help: |
+      Live data files on PARTITIONED tables with broken
+      `ducklake_file_partition_value` rows: the sorted set of
+      partition_key_index values for a file is not exactly {0..ncols-1}, or a
+      partition_value is NULL. This is the ducklake_add_data_files() bug where
+      a multi-transform-on-one-source-column spec (events year/month/day,
+      persons year/month) writes fpv rows at wrong/collapsed indices instead
+      of one per partition column — tier-3 compaction then aborts catalog-wide
+      with "DuckLakeCompactor: Files have different hive partition path", and
+      partition pruning silently misses files.
+
+      Detects "will compaction abort", which is BROADER than what the millpond
+      `repair-partition-values` cron auto-clears: that task only touches the
+      `posthog` schema's events*/persons* tables with S3-absolute hive-shaped
+      paths. So `files > 0` on a non-posthog table, or on lake-relative /
+      `/full/` paths, is real corruption that the recurring repair will NOT
+      fix — it needs manual repair or an extended tool. The index-set check
+      here matches the repair's internal _count_broken predicate (exact index
+      set), so on the tables the repair DOES cover, metric and remediation
+      agree.
+
+      Emitted per offending {schema_name, table_name}; a healthy table
+      produces no series (the publisher deletes it on the next cycle), so
+      alert on presence — any `ducklake_partition_value_corruption_files > 0`
+      means tier-3 compaction is blocked on that table. Unpartitioned tables
+      cannot have this and are excluded by the pcols inner join.
+    labels: [schema_name, table_name]
+    values: [files]
+    sql: |
+      WITH pcols AS (
+        -- Partition-column count per table. DISTINCT (table_id, column_id)
+        -- guards against join fan-out if a table_id ever has more than one
+        -- live partition_info row (writer-protocol invariant, not DB-enforced
+        -- — same defense as ducklake_stats_rows).
+        SELECT table_id, COUNT(*) AS ncols
+        FROM (
+          SELECT DISTINCT pi.table_id, pc.column_id
+          FROM public.ducklake_partition_info pi
+          JOIN public.ducklake_partition_column pc USING (partition_id)
+          WHERE pi.end_snapshot IS NULL
+        ) d
+        GROUP BY table_id
+      ),
+      perfile AS (
+        -- One row per live file of a partitioned table: the sorted distinct
+        -- index set and whether any partition_value is NULL. fpv joined on
+        -- (data_file_id, table_id) for parity with millpond's repair. A file
+        -- with zero fpv rows array_aggs to NULL, which IS DISTINCT FROM the
+        -- expected set below — correctly flagged.
+        SELECT df.table_id, pc.ncols,
+               array_agg(DISTINCT fpv.partition_key_index ORDER BY fpv.partition_key_index)
+                 FILTER (WHERE fpv.partition_key_index IS NOT NULL) AS idx,
+               bool_or(fpv.partition_value IS NULL)                 AS has_null
+        FROM public.ducklake_data_file df
+        JOIN pcols pc USING (table_id)
+        LEFT JOIN public.ducklake_file_partition_value fpv
+               ON fpv.data_file_id = df.data_file_id AND fpv.table_id = df.table_id
+        WHERE df.end_snapshot IS NULL
+        GROUP BY df.table_id, df.data_file_id, pc.ncols
+      ),
+      bad AS (
+        -- Per-table corrupt-file count, computed keyed by table_id BEFORE any
+        -- table/schema join so the count can never be inflated by a duplicate
+        -- live ducklake_table row.
+        SELECT table_id, COUNT(*) AS files
+        FROM perfile
+        WHERE idx IS DISTINCT FROM ARRAY(SELECT generate_series(0::bigint, (ncols - 1)::bigint))
+           OR has_null
+        GROUP BY table_id
+      )
+      SELECT s.schema_name, t.table_name, b.files
+      FROM bad b
+      JOIN (
+        SELECT DISTINCT table_id, schema_id, table_name
+        FROM public.ducklake_table WHERE end_snapshot IS NULL
+      ) t ON t.table_id = b.table_id
+      JOIN public.ducklake_schema s ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL

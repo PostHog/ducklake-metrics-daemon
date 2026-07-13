@@ -15,6 +15,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/posthog/ducklake-metrics-daemon/internal/queries"
 )
 
 func TestLivenessInitial(t *testing.T) {
@@ -111,5 +113,84 @@ func TestStaggerDeterministic(t *testing.T) {
 func TestStaggerZeroInterval(t *testing.T) {
 	if got := stagger("anything", 0); got != 0 {
 		t.Errorf("stagger(_, 0)=%v, want 0", got)
+	}
+}
+
+func TestDueQueriesNoIntervalReturnsAllUnchanged(t *testing.T) {
+	qs := []queries.Query{{Name: "a"}, {Name: "b"}}
+	last := map[string]time.Time{}
+	got := dueQueries(qs, last, time.Now())
+	if len(got) != 2 {
+		t.Fatalf("want all 2 queries, got %d", len(got))
+	}
+	// No-interval path must not record run times (and must not allocate a
+	// new slice — it returns the input).
+	if len(last) != 0 {
+		t.Errorf("no-interval path should not touch lastRun, got %d entries", len(last))
+	}
+}
+
+func TestDueQueriesRespectsInterval(t *testing.T) {
+	qs := []queries.Query{
+		{Name: "fast"},                        // every cycle
+		{Name: "slow", IntervalSeconds: 3600}, // hourly
+	}
+	last := map[string]time.Time{}
+	t0 := time.Unix(1_000_000, 0)
+
+	// First fire: both due (slow has no prior run).
+	got := dueQueries(qs, last, t0)
+	if len(got) != 2 {
+		t.Fatalf("first fire: want 2, got %d", len(got))
+	}
+
+	// 5 min later: only fast is due; slow's window hasn't elapsed.
+	got = dueQueries(qs, last, t0.Add(5*time.Minute))
+	if len(got) != 1 || got[0].Name != "fast" {
+		t.Fatalf("second fire: want [fast], got %+v", names(got))
+	}
+
+	// 61 min after t0: slow is due again.
+	got = dueQueries(qs, last, t0.Add(61*time.Minute))
+	if len(got) != 2 {
+		t.Fatalf("hourly fire: want 2, got %+v", names(got))
+	}
+}
+
+func names(qs []queries.Query) []string {
+	out := make([]string, len(qs))
+	for i, q := range qs {
+		out[i] = q.Name
+	}
+	return out
+}
+
+func TestDueQueriesHourlyOverManyCycles(t *testing.T) {
+	// 5-min cycles, one hourly query: over 24 cycles (2h) it must fire
+	// exactly twice (cycle 0 and cycle 12), never in between.
+	qs := []queries.Query{{Name: "fast"}, {Name: "slow", IntervalSeconds: 3600}}
+	last := map[string]time.Time{}
+	base := time.Unix(2_000_000, 0)
+	slowFires := 0
+	for i := 0; i < 24; i++ {
+		due := dueQueries(qs, last, base.Add(time.Duration(i)*5*time.Minute))
+		for _, q := range due {
+			if q.Name == "slow" {
+				slowFires++
+			}
+		}
+	}
+	if slowFires != 2 {
+		t.Fatalf("hourly query over 24×5min cycles: want 2 fires, got %d", slowFires)
+	}
+}
+
+func TestDueQueriesNoIntervalReturnsSameBackingArray(t *testing.T) {
+	// The common (no custom interval) path must return the input slice
+	// itself — no per-cycle allocation.
+	qs := []queries.Query{{Name: "a"}, {Name: "b"}}
+	got := dueQueries(qs, map[string]time.Time{}, time.Now())
+	if len(got) != len(qs) || &got[0] != &qs[0] {
+		t.Fatalf("no-interval path must return the same backing array, got a copy")
 	}
 }

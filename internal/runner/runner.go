@@ -127,6 +127,13 @@ func Run(ctx context.Context, cfg Config) {
 	cancelPrev := func() {}
 	defer func() { cancelPrev() }() // shutdown: kill in-flight cycle
 
+	// Per-query last-run tracking for queries that opt into their own
+	// cadence via interval_seconds. Owned solely by this Run goroutine
+	// (mutated only inside fire, which the scheduler invokes serially),
+	// so no synchronization is needed — the due set is computed HERE
+	// and handed to the cycle goroutine as its own slice, never shared.
+	lastRun := make(map[string]time.Time, len(cfg.Queries))
+
 	fire := func() {
 		// If the prior cycle is still running, this cancel signals it
 		// to abort; its deferred metrics observe ctx.Err() and bump
@@ -137,7 +144,17 @@ func Run(ctx context.Context, cfg Config) {
 		cancelPrev = cancel
 		cfg.Liveness.MarkFire()
 		cfg.Self.SchedulerFiresTotal.WithLabelValues(cfg.Tenant).Inc()
-		go runCycle(cctx, cfg, tlog)
+
+		// Select the queries due this tick. interval_seconds<=0 runs
+		// every cycle; a positive interval runs only once its window
+		// has elapsed since the last run. lastRun is empty at startup,
+		// so every query (including slow-cadence ones) runs on the
+		// first fire — /metrics populates promptly. QueryTimeout still
+		// bounds each execution, so a slow-cadence query can't overrun
+		// the cycle.
+		cycleCfg := cfg
+		cycleCfg.Queries = dueQueries(cfg.Queries, lastRun, time.Now())
+		go runCycle(cctx, cycleCfg, tlog)
 	}
 
 	fire() // fire immediately on startup so /metrics populates fast
@@ -218,6 +235,39 @@ func runCycle(ctx context.Context, cfg Config, tlog *slog.Logger) {
 	}
 
 	completed = true
+}
+
+// dueQueries returns the subset of qs to run this tick and records their
+// run time in lastRun (mutated in place). A query with IntervalSeconds<=0
+// is always due; one with a positive interval is due only once that many
+// seconds have elapsed since its last recorded run (and always on its
+// first-ever run, since lastRun has no entry). When no query opts into a
+// custom interval, qs is returned unchanged (no allocation) — the common
+// case. Not safe for concurrent use; the scheduler calls it from a single
+// goroutine.
+func dueQueries(qs []queries.Query, lastRun map[string]time.Time, now time.Time) []queries.Query {
+	anyInterval := false
+	for i := range qs {
+		if qs[i].IntervalSeconds > 0 {
+			anyInterval = true
+			break
+		}
+	}
+	if !anyInterval {
+		return qs
+	}
+	due := make([]queries.Query, 0, len(qs))
+	for _, q := range qs {
+		if q.IntervalSeconds > 0 {
+			if last, ok := lastRun[q.Name]; ok &&
+				now.Sub(last) < time.Duration(q.IntervalSeconds)*time.Second {
+				continue
+			}
+		}
+		lastRun[q.Name] = now
+		due = append(due, q)
+	}
+	return due
 }
 
 // stagger derives a deterministic per-tenant initial offset in
