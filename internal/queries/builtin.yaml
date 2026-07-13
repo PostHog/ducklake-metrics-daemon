@@ -281,7 +281,11 @@ queries:
       produces no series (the publisher deletes it on the next cycle), so
       alert on presence — any `ducklake_partition_value_corruption_files > 0`
       means tier-3 compaction is blocked on that table. Unpartitioned tables
-      cannot have this and are excluded by the pcols inner join.
+      are excluded by the pcols inner join, and individual UNPARTITIONED
+      files within a partitioned table (zero fpv rows — lake-relative
+      ducklake-<uuid>.parquet inline/seed writes) are excluded too: they
+      carry no partition path, so they can't cause the hive mismatch, and
+      repair-partition-values skips them the same way.
     labels: [schema_name, table_name]
     values: [files]
     sql: |
@@ -322,10 +326,22 @@ queries:
         -- Per-table corrupt-file count, computed keyed by table_id BEFORE any
         -- table/schema join so the count can never be inflated by a duplicate
         -- live ducklake_table row.
+        --
+        -- idx IS NOT NULL: only judge files that actually carry partition
+        -- values. A live file of a partitioned table can legitimately have
+        -- ZERO fpv rows — an unpartitioned/lake-relative file
+        -- (ducklake-<uuid>.parquet at the lake root, e.g. an inline-data
+        -- flush or seed write). Those aren't hive-partitioned, so they can't
+        -- have the index/hive-path mismatch that blocks tier-3 compaction,
+        -- and repair-partition-values skips them too (S3-absolute hive paths
+        -- only). Without this guard, array_agg over zero rows is NULL, which
+        -- IS DISTINCT FROM the expected set, false-flagging every such file
+        -- (observed: 1 per megaduck table while tier-3 compaction ran fine).
         SELECT table_id, COUNT(*) AS files
         FROM perfile
-        WHERE idx IS DISTINCT FROM ARRAY(SELECT generate_series(0::bigint, (ncols - 1)::bigint))
-           OR has_null
+        WHERE idx IS NOT NULL
+          AND (idx IS DISTINCT FROM ARRAY(SELECT generate_series(0::bigint, (ncols - 1)::bigint))
+               OR has_null)
         GROUP BY table_id
       )
       SELECT s.schema_name, t.table_name, b.files
