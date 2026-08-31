@@ -18,7 +18,7 @@
 # trivial attack-surface bump. Inspired by:
 # https://amf3.github.io/articles/virtualization/inject_busybox/
 
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27-alpine AS builder
 WORKDIR /src
 # Cache deps in their own layer so source-only changes don't re-download.
 COPY go.mod go.sum ./
